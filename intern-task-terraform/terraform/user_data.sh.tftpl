@@ -1,0 +1,65 @@
+#!/bin/bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+# 1. Create a non-root user with passwordless sudo
+if ! id -u "${admin_username}" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash -G sudo "${admin_username}"
+fi
+echo "${admin_username} ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/90-${admin_username}
+chmod 0440 /etc/sudoers.d/90-${admin_username}
+
+# 2. Install Docker Engine and UFW host firewall
+apt-get update -y
+apt-get install -y docker.io ufw
+
+systemctl enable --now docker
+usermod -aG docker "${admin_username}"
+
+# 3. Write intern-task-app source and Dockerfile from the repository
+mkdir -p /opt/intern-task-app/app
+
+cat <<'EOF' >/opt/intern-task-app/Dockerfile
+${dockerfile_content}
+EOF
+
+cat <<'EOF' >/opt/intern-task-app/app/app.py
+${app_py_content}
+EOF
+
+chown -R "${admin_username}:${admin_username}" /opt/intern-task-app
+
+# 4. Build the Docker image from intern-task-app's Dockerfile
+docker build -t intern-task-app:local /opt/intern-task-app
+
+# 5. Create and enable a systemd service to run the container across reboots
+cat <<EOF >/etc/systemd/system/intern-task-app.service
+[Unit]
+Description=Intern Task App Container
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker rm -f intern-task-app
+ExecStart=/usr/bin/docker run --rm --name intern-task-app -p ${app_port}:${app_port} -e PORT=${app_port} intern-task-app:local
+ExecStop=/usr/bin/docker stop intern-task-app
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now intern-task-app.service
+
+# 6. Configure the host firewall (UFW) so only the app's port is reachable
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow "${app_port}/tcp"
+ufw --force enable
